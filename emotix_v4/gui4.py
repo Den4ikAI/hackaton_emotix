@@ -1,316 +1,130 @@
+# Стандартные библиотеки
 import sys
+import time
+import warnings
+from typing import Dict, Tuple, Optional, Union
+# Сторонние библиотеки
 import cv2
-import numpy as np
 import mediapipe as mp
+import numpy as np
+import torch
+from PIL import Image
+from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QProgressBar, QSlider, QSpinBox, QDoubleSpinBox, QFormLayout,
-    QFrame, QSizePolicy, QDialog, QRadioButton, QLineEdit, QFileDialog, QComboBox
+    QPushButton,
+    QFrame, QDialog, QComboBox
 )
-from PyQt6.QtGui import QImage, QPixmap, QFont, QColor, QPalette
-from PyQt6.QtCore import QTimer, Qt, QSize, QTime
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
-import time
-from PIL import Image
-import torch
+
 from torchvision import transforms
-from transformers import ViTForImageClassification, ViTImageProcessor
-
+from transformers import AutoModelForImageClassification, AutoImageProcessor
+from emotixV4 import EmotixV4Emotion
+from qt_elements import HeartRateChart, StressChart, EmotionBarChart, StyledProgressBar, SourceSelectionDialog, EmotionsChart, ModelSelectionDialog
+# Настройки
+warnings.simplefilter("ignore", UserWarning)
 from utils import (
-    find_face_and_hands, get_bpm_tells, is_blinking, check_hand_on_face,
-    get_avg_gaze, get_lip_ratio, get_face_relative_area, get_area, detect_gaze_change
+    find_face_and_hands, is_blinking, check_hand_on_face,
+    get_avg_gaze, get_lip_ratio, get_face_relative_area, calculate_gaze_score
 )
-
+from pulse_detector import  PulseDetector
 FRAMES_PER_ANALYSIS = 10
 
-# Load the pre-trained model and processor
-model_name = "emotion"
-model = ViTForImageClassification.from_pretrained(model_name)
-processor = ViTImageProcessor.from_pretrained(model_name)
-model_path = "stress"
-stress_model = ViTForImageClassification.from_pretrained(model_path)
-stress_model.eval()
 
-# Define image transformations for the stress model
-stress_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
+class StressModel:
+    def __init__(self, model_path) -> None:
+        self.stress_model = AutoModelForImageClassification.from_pretrained(model_path)
+        self.stress_model.eval()
+        self.stress_transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
 
-# Load Haar cascade for face detection
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    def detect_stress(self, image, face_landmarks):
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        h, w, _ = image.shape
+        face_points = [(int(landmark.x * w), int(landmark.y * h)) for landmark in face_landmarks]
+        left = min(point[0] for point in face_points)
+        top = min(point[1] for point in face_points)
+        right = max(point[0] for point in face_points)
+        bottom = max(point[1] for point in face_points)
+        
+        face_image = Image.fromarray(image[top:bottom, left:right])
+        
+        input_tensor = self.stress_transform(face_image).unsqueeze(0)
+        
+        with torch.no_grad():
+            outputs = self.stress_model(input_tensor)
+        
+        probabilities = torch.nn.functional.softmax(outputs.logits, dim=-1)
+        confidence = probabilities[0][0].item()
 
-def detect_and_crop_face(image):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray, 1.1, 4)
-    
-    if len(faces) > 0:
-        x, y, w, h = faces[0]  # Take the first detected face
-        face = gray[y:y+h, x:x+w]  # Use grayscale image
-        return face, (x, y, w, h)
-    else:
+        return confidence
+
+class EmotionModel:
+    def __init__(self, checkpoint_path) -> None:
+        self.emotixv4emotion = EmotixV4Emotion(checkpoint_path = checkpoint_path)
+
+    def detect_face(self, image: np.ndarray, coords) -> Tuple[Optional[np.ndarray], Optional[Tuple[int, int, int, int]]]:
+        faces = [coords]
+        
+        if len(faces) > 0:
+            x, y, w, h = faces[0]
+            face = image[y:y+h, x:x+w]
+            return face, (x, y, w, h)
         return None, None
 
-def classify_image(image):
-    # Detect and crop face
-    face, face_coords = detect_and_crop_face(image)
-    
-    if face is None:
-        return None
-    
-    # Convert image to monochrome PIL format and add channel
-    face_pil = Image.fromarray(face).convert('L')
-    face_array = np.array(face_pil)
-    face_array = np.expand_dims(face_array, axis=2)  # Add channel
-    face_array = np.repeat(face_array, 3, axis=2)  # Repeat channel thrice for RGB
-    face_pil = Image.fromarray(face_array)
-    
-    # Transform image for the model
-    inputs = processor(images=face_pil, return_tensors="pt")
-    
-    # Get prediction
-    with torch.no_grad():
-        outputs = model(**inputs)
-    
-    # Get probabilities and class labels
-    logits = outputs.logits
-    probs = torch.nn.functional.softmax(logits, dim=-1)
-    
-    # Get top-5 predictions
-    top5_prob, top5_catid = torch.topk(probs, 7)
-    
-    # Format results as a dictionary
-    results = {
-        model.config.id2label[top5_catid[0][i].item()]: float(top5_prob[0][i].item())
-        for i in range(top5_prob.size(1))
-    }
-    
-    return results
-
-class HeartRateChart(FigureCanvas):
-    def __init__(self, parent=None, width=5, height=4, dpi=100):
-        fig = Figure(figsize=(width, height), dpi=dpi)
-        self.axes = fig.add_subplot(111)
-        super(HeartRateChart, self).__init__(fig)
-        self.setParent(parent)
+    def predict(self, image: np.ndarray, top_k: int = 5, coords: tuple = (None,None,None,None)) -> Optional[Dict[str, float]]:
+        if image is None:
+            return None
+        # Detect and crop face
+        face_img, _ = self.detect_face(image, coords)
+        if any(x < 0 for x in coords):
+            return {'neutral': 0.0001, 'happy': 0.0001, 'sad': 0.0001, 'surprise': 0.0001, 'fear': 0.0001, 'disgust': 0.0001, 'angry': 0.0001}
         
-        self.hr_times = []
-        self.hr_values = []
-        self.line, = self.axes.plot(self.hr_times, self.hr_values, color='#2ecc71')
-        self.axes.set_ylim(60, 140)
-        self.axes.set_xlim(0, 60)
-        self.axes.set_facecolor('#f0f0f0')
-        self.axes.set_xlabel("Время (сек)", fontsize=10)
-        self.axes.set_ylabel("Сердцебиение", fontsize=10)
-        self.axes.grid(True, linestyle='--', alpha=0.7)
-        fig.tight_layout()
+        out = self.emotixv4emotion.predict(face_img)
+        return out
 
-    def update_chart(self, new_time, new_value):
-        self.hr_times.append(new_time)
-        self.hr_values.append(new_value)
+
+class Pulse:
+    def __init__(self) -> None:
+        self.pulse_detector = PulseDetector()
+
+    def detect_face(self, image: np.ndarray, coords) -> Tuple[Optional[np.ndarray], Optional[Tuple[int, int, int, int]]]:
+        faces = [coords]
         
-        while self.hr_times and self.hr_times[0] < new_time - 60:
-            self.hr_times.pop(0)
-            self.hr_values.pop(0)
+        if len(faces) > 0:
+            x, y, w, h = faces[0]
+            face = image[y:y+h, x:x+w]
+            return face, (x, y, w, h)
+        return None, None
+
+    def predict(self, image: np.ndarray, coords: tuple = (None,None,None,None)) -> Optional[Dict[str, float]]:
+        if image is None:
+            return None
+        # Detect and crop face
+        face_img, _ = self.detect_face(image, coords)
+        if face_img is []:
+            return None
         
-        self.line.set_data(self.hr_times, self.hr_values)
-        self.axes.relim()
-        self.axes.autoscale_view()
-        self.draw()
+        out = self.pulse_detector.get_pulse(face_img)
+        return out if out else 0.0
 
-class StressChart(FigureCanvas):
-    def __init__(self, parent=None, width=5, height=4, dpi=100):
-        fig = Figure(figsize=(width, height), dpi=dpi)
-        self.axes = fig.add_subplot(111)
-        super(StressChart, self).__init__(fig)
-        self.setParent(parent)
-        
-        self.stress_times = []
-        self.stress_values = []
-        self.line, = self.axes.plot(self.stress_times, self.stress_values, color='#e74c3c')
-        self.axes.set_ylim(0, 100)
-        self.axes.set_xlim(0, 60)
-        self.axes.set_facecolor('#f0f0f0')
-        self.axes.set_xlabel("Время (сек)", fontsize=10)
-        self.axes.set_ylabel("Уровень стресса", fontsize=10)
-        self.axes.grid(True, linestyle='--', alpha=0.7)
-        fig.tight_layout()
 
-    def update_chart(self, new_time, new_value):
-        self.stress_times.append(new_time)
-        self.stress_values.append(new_value)
-        
-        while self.stress_times and self.stress_times[0] < new_time - 60:
-            self.stress_times.pop(0)
-            self.stress_values.pop(0)
-        
-        self.line.set_data(self.stress_times, self.stress_values)
-        self.axes.relim()
-        self.axes.autoscale_view()
-        self.draw()
-
-class EmotionBarChart(FigureCanvas):
-    def __init__(self, parent=None, width=5, height=4, dpi=100):
-        fig = Figure(figsize=(width, height), dpi=dpi)
-        self.axes = fig.add_subplot(111)
-        super(EmotionBarChart, self).__init__(fig)
-        self.setParent(parent)
-        
-        self.axes.set_facecolor('#f0f0f0')
-        fig.tight_layout()
-
-    def update_chart(self, emotions):
-        self.axes.clear()
-        
-        # Sort emotions in descending order of values
-        sorted_emotions = sorted(emotions.items(), key=lambda x: x[1], reverse=True)
-        
-        # Select top 3 emotions
-        top_emotions = sorted_emotions[:3]
-        
-        # Extract labels and values for top 3 emotions
-        labels = [emotion[0] for emotion in top_emotions]
-        sizes = [emotion[1] for emotion in top_emotions]
-        
-        # Set positions for labels on the x-axis
-        x_positions = range(len(labels))
-        
-        # Create a bar chart
-        self.axes.bar(x_positions, sizes)
-        
-        # Set labels on the x-axis
-        self.axes.set_xticks(x_positions)
-        self.axes.set_xticklabels(labels)
-        
-        
-        # Customize the appearance of the chart
-        self.draw()
-
-class StyledProgressBar(QProgressBar):
-    def __init__(self, *args, **kwargs):
-        super(StyledProgressBar, self).__init__(*args, **kwargs)
-        self.setStyleSheet("""
-            QProgressBar {
-                border: 2px solid #bdc3c7;
-                border-radius: 5px;
-                text-align: center;
-            }
-            QProgressBar::chunk {
-                background-color: #2ecc71;
-                width: 10px;
-                margin: 0.5px;
-            }
-        """)
-
-class SourceSelectionDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Выбор источника видео")
-        self.setStyleSheet("""
-            QDialog {
-                background-color: #2c3e50;
-            }
-            QLabel {
-                color: #ecf0f1;
-                font-size: 14px;
-            }
-            QRadioButton {
-                color: #ecf0f1;
-                font-size: 14px;
-            }
-            QComboBox, QLineEdit {
-                background-color: #34495e;
-                color: #ecf0f1;
-                border: 1px solid #2c3e50;
-                border-radius: 5px;
-                padding: 5px;
-                font-size: 14px;
-            }
-            QPushButton {
-                background-color: #3498db;
-                color: #ecf0f1;
-                border: none;
-                padding: 10px;
-                border-radius: 5px;
-                font-size: 16px;
-            }
-            QPushButton:hover {
-                background-color: #2980b9;
-            }
-        """)
-
-        layout = QVBoxLayout()
-
-        self.camera_radio = QRadioButton("Камера")
-        self.file_radio = QRadioButton("Файл")
-        self.rtsp_radio = QRadioButton("RTSP поток")
-
-        layout.addWidget(self.camera_radio)
-        layout.addWidget(self.file_radio)
-        layout.addWidget(self.rtsp_radio)
-
-        self.camera_combo = QComboBox()
-        self.populate_camera_list()
-        layout.addWidget(self.camera_combo)
-
-        self.file_path = QLineEdit()
-        self.file_browse = QPushButton("Выбрать")
-        self.file_browse.clicked.connect(self.browse_file)
-        file_layout = QHBoxLayout()
-        file_layout.addWidget(self.file_path)
-        file_layout.addWidget(self.file_browse)
-        layout.addLayout(file_layout)
-
-        self.rtsp_url = QLineEdit()
-        layout.addWidget(self.rtsp_url)
-
-        self.ok_button = QPushButton("OK")
-        self.ok_button.clicked.connect(self.accept)
-        layout.addWidget(self.ok_button)
-
-        self.setLayout(layout)
-
-        self.camera_radio.toggled.connect(self.update_ui)
-        self.file_radio.toggled.connect(self.update_ui)
-        self.rtsp_radio.toggled.connect(self.update_ui)
-
-        self.camera_radio.setChecked(True)
-        self.update_ui()
-
-    def populate_camera_list(self):
-        self.camera_combo.clear()
-        for i in range(10):  # Check first 10 camera indices
-            cap = cv2.VideoCapture(i)
-            if cap.isOpened():
-                self.camera_combo.addItem(f"Camera {i}")
-                cap.release()
-
-    def update_ui(self):
-        self.camera_combo.setEnabled(self.camera_radio.isChecked())
-        self.file_path.setEnabled(self.file_radio.isChecked())
-        self.file_browse.setEnabled(self.file_radio.isChecked())
-        self.rtsp_url.setEnabled(self.rtsp_radio.isChecked())
-
-    def browse_file(self):
-        file_name, _ = QFileDialog.getOpenFileName(self, "Select Video File", "", "Video Files (*.mp4 *.avi *.mov)")
-        if file_name:
-            self.file_path.setText(file_name)
-
-    def get_source(self):
-        if self.camera_radio.isChecked():
-            return "camera", self.camera_combo.currentIndex()
-        elif self.file_radio.isChecked():
-            return "file", self.file_path.text()
-        elif self.rtsp_radio.isChecked():
-            return "rtsp", self.rtsp_url.text()
 
 class FaceAnalysisApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Анализ эмоций")
         self.setGeometry(100, 100, 1280, 800)
+        self.emotion_processors = {
+            "EmotiX-SMALL": self.process_emotions_small,
+            "EmotiX-Thermal [WIP]": self.process_emotions_small
+        }
+        self.current_processor = "EmotiX-SMALL"
+
         self.setStyleSheet("""
             QMainWindow {
                 background-color: #f0f0f0;
@@ -333,6 +147,47 @@ class FaceAnalysisApp(QMainWindow):
             QFrame {
                 background-color: white;
                 border-radius: 10px;
+            }
+            QComboBox {
+                background-color: #ffffff;
+                border: 2px solid #3498db;
+                border-radius: 5px;
+                padding: 8px;
+                min-width: 200px;
+                color: #2c3e50;
+                font-size: 14px;
+            }
+            QComboBox::drop-down {
+                border: none;
+                padding-right: 20px;
+            }
+            QComboBox::down-arrow {
+                image: url(down_arrow.png);
+                width: 12px;
+                height: 12px;
+            }
+            QComboBox:hover {
+                border-color: #2980b9;
+            }
+            QComboBox QAbstractItemView {
+                background-color: white;
+                border: 2px solid #3498db;
+                border-radius: 5px;
+                selection-background-color: #3498db;
+                selection-color: white;
+            }
+            #modelSelectionFrame {
+                background-color: #ffffff;
+                border: 1px solid #e0e0e0;
+                border-radius: 10px;
+                padding: 15px;
+                margin: 10px;
+            }
+            #modelSelectionLabel {
+                font-size: 16px;
+                font-weight: bold;
+                color: #2c3e50;
+                margin-bottom: 10px;
             }
         """)
 
@@ -363,6 +218,62 @@ class FaceAnalysisApp(QMainWindow):
         video_layout.addWidget(self.video_label)
         video_emotion_layout.addWidget(video_frame)
 
+        # Создаем стильную панель выбора модели в правой колонке
+        model_selection_frame = QFrame()
+        model_selection_frame.setObjectName("modelSelectionFrame")
+        model_selection_layout = QVBoxLayout(model_selection_frame)
+        
+        # Заголовок для выбора модели
+        model_selection_label = QLabel("Выбор модели классификации")
+        model_selection_label.setObjectName("modelSelectionLabel")
+        model_selection_layout.addWidget(model_selection_label)
+        
+        # Комбобокс для выбора модели
+        self.processor_combo = QComboBox()
+        self.processor_combo.addItems(list(self.emotion_processors.keys()))
+        self.processor_combo.currentTextChanged.connect(self.change_emotion_processor)
+        model_selection_layout.addWidget(self.processor_combo)
+        
+        # Добавляем растягивающийся спейсер
+        model_selection_layout.addStretch()
+        
+        pulse_frame = QFrame()
+        pulse_frame.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Raised)
+        pulse_layout = QVBoxLayout(pulse_frame)
+
+        pulse_title = QLabel("Пульс")
+        pulse_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pulse_title.setStyleSheet("""
+            font-size: 16px;
+            font-weight: bold;
+            color: #2c3e50;
+            margin-bottom: 10px;
+        """)
+        pulse_layout.addWidget(pulse_title)
+
+        # Current Pulse
+        current_pulse_layout = QHBoxLayout()
+        self.current_pulse_value = QLabel("-- уд/мин")
+        current_pulse_layout.addWidget(self.current_pulse_value)
+        current_pulse_widget = QWidget()
+        current_pulse_widget.setLayout(current_pulse_layout)
+        pulse_layout.addWidget(current_pulse_widget)
+
+        # Стилизация значений пульса
+        pulse_value_style = """
+            QLabel {
+                font-size: 14px;
+                color: #2c3e50;
+                padding: 5px;
+                background-color: #f8f9fa;
+                border-radius: 5px;
+                min-width: 80px;
+            }
+        """
+        self.current_pulse_value.setStyleSheet(pulse_value_style)
+
+        # Добавляем панель выбора модели в правую колонку
+
         # Emotion Pie Chart
         emotion_chart_frame = QFrame()
         emotion_chart_frame.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Raised)
@@ -381,9 +292,11 @@ class FaceAnalysisApp(QMainWindow):
         self.chart = HeartRateChart(self, width=8, height=2)
         charts_layout.addWidget(self.chart)
         
-        self.stress_chart = StressChart(self, width=8, height=2)
-        charts_layout.addWidget(self.stress_chart)
+        #self.stress_chart = StressChart(self, width=8, height=2)
+        #charts_layout.addWidget(self.stress_chart)
         
+        self.emotions_chart = EmotionsChart(self, width=8, height=2)
+        charts_layout.addWidget(self.emotions_chart)      
         left_layout.addWidget(charts_frame)
 
         # Controls
@@ -398,6 +311,13 @@ class FaceAnalysisApp(QMainWindow):
         self.source_button.clicked.connect(self.select_source)
         
         controls_layout.addWidget(self.source_button)
+
+
+        self.select_model_button = QPushButton("Выбрать модель")
+        self.select_model_button.clicked.connect(self.select_model)
+        controls_layout.addWidget(self.select_model_button)
+
+
         self.clear_button = QPushButton("Очистить интерфейс")
         self.clear_button.clicked.connect(self.clear_interface)
         self.clear_button.setStyleSheet("""
@@ -413,6 +333,13 @@ class FaceAnalysisApp(QMainWindow):
                 background-color: #c0392b;
             }
         """)
+
+        self.stress_button = QPushButton("Учитывать стресс в эмоциях - выключено", self)
+        self.stress_button.setCheckable(True)
+        self.stress_button.setChecked(False)
+        self.stress_button.clicked.connect(self.toggle_stress_consideration)
+
+        controls_layout.addWidget(self.stress_button)
         controls_layout.addWidget(self.clear_button)
 
         right_layout.addWidget(controls_frame)
@@ -426,6 +353,32 @@ class FaceAnalysisApp(QMainWindow):
         emotions_layout.addWidget(emotions_title)
         self.emotions_label = QLabel()
         self.emotions_label.setAlignment(Qt.AlignmentFlag.AlignTop)
+        emotion_translations = {
+            "sad": "грусть",
+            "disgust": "отвращение",
+            "angry": "злость",
+            "neutral": "нейтральность",
+            "fear": "страх",
+            "surprise": "удивление",
+            "happy": "радость"
+        }
+        
+        zero_emotions = {
+            "neutral": 0.0,
+            "happy": 0.0,
+            "sad": 0.0,
+            "surprise": 0.0,
+            "fear": 0.0,
+            "disgust": 0.0,
+            "angry": 0.0
+        }
+        # Берем только 4 самых выраженных
+        emotion_text = "Обнаруженные эмоции в кадре:\n"
+        for emotion, probability in zero_emotions.items():
+            translated_emotion = emotion_translations.get(emotion, emotion)
+            emotion_text += f"{translated_emotion}: {probability:.2%}\n"
+        # Clear emotion label
+        self.emotions_label.setText(emotion_text)
         emotions_layout.addWidget(self.emotions_label)
         right_layout.addWidget(emotions_frame)
 
@@ -442,19 +395,24 @@ class FaceAnalysisApp(QMainWindow):
         self.stress_bar.setFixedHeight(30)
         stress_layout.addWidget(self.stress_bar)
         right_layout.addWidget(stress_frame)
+        right_layout.addWidget(pulse_frame)
+
 
         self.timer_label = QLabel("00:00")
         self.timer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.timer_label.setStyleSheet("font-size: 24px; color: #2c3e50;")
         controls_layout.addWidget(self.timer_label)
-
+        #right_layout.addWidget(model_selection_frame)
         # Spacer to push controls to the top
         right_layout.addStretch()
 
         # Skip frames for video file
-        self.frame_skip = 2
+        self.frame_skip = 3
 
         # Initialize other variables and setup
+        self.emotion_emotixsmall = EmotionModel("models_emotix_v4/emotion/checkpoint.bin")
+        self.stress_detector = StressModel("models_emotix_v4/stress")
+        self.pulse_predictor = Pulse()
         self.setup_variables()
 
     def setup_variables(self):
@@ -494,10 +452,13 @@ class FaceAnalysisApp(QMainWindow):
         self.bpm_values = []
         self.blink_count = 0
         self.hand_on_face_count = 0
-        self.gaze_values = [0] * FRAMES_PER_ANALYSIS
+        self.gaze_values = []
         self.avg_gaze = None
         self.stress_levels = []
         self.avg_stress = None
+        self.consider_stress = False
+
+
 
     def select_source(self):
         dialog = SourceSelectionDialog(self)
@@ -545,8 +506,7 @@ class FaceAnalysisApp(QMainWindow):
         self.frame_count = 0
         self.chart.hr_times.clear()
         self.chart.hr_values.clear()
-        self.stress_chart.stress_times.clear()
-        self.stress_chart.stress_values.clear()
+        self.emotions_chart.clear_chart()
         self.stress_bar.setValue(0)
         self.blinks = [False] * FRAMES_PER_ANALYSIS * 4
         self.hand_on_face = [False] * FRAMES_PER_ANALYSIS
@@ -581,9 +541,7 @@ class FaceAnalysisApp(QMainWindow):
         self.chart.hr_times.clear()
         self.chart.hr_values.clear()
         self.chart.update_chart(0, 0)
-        self.stress_chart.stress_times.clear()
-        self.stress_chart.stress_values.clear()
-        self.stress_chart.update_chart(0, 0)
+        self.emotions_chart.clear_chart()
 
         # Reset stress bar
         self.stress_bar.setValue(0)
@@ -616,9 +574,32 @@ class FaceAnalysisApp(QMainWindow):
         self.avg_gaze = None
         self.stress_levels = []
 
+        emotion_translations = {
+            "sad": "грусть",
+            "disgust": "отвращение",
+            "angry": "злость",
+            "neutral": "нейтральность",
+            "fear": "страх",
+            "surprise": "удивление",
+            "happy": "радость"
+        }
+        
+        zero_emotions = {
+            "neutral": 0.0,
+            "happy": 0.0,
+            "sad": 0.0,
+            "surprise": 0.0,
+            "fear": 0.0,
+            "disgust": 0.0,
+            "angry": 0.0
+        }
+        emotion_text = "Обнаруженные эмоции в кадре:\n"
+        for emotion, probability in zero_emotions.items():
+            translated_emotion = emotion_translations.get(emotion, emotion)
+            emotion_text += f"{translated_emotion}: {probability:.2%}\n"
         # Clear emotion label
-        self.emotions_label.setText("")
-
+        self.emotions_label.setText(emotion_text)
+        self.current_pulse_value.setText("-- уд/мин")
         # Reset video label
         self.video_label.clear()
 
@@ -627,6 +608,27 @@ class FaceAnalysisApp(QMainWindow):
         minutes = self.stopwatch_seconds // 60
         seconds = self.stopwatch_seconds % 60
         self.timer_label.setText(f"{minutes:02d}:{seconds:02d}")
+
+    def process_emotions_small(self, frame, coords):
+        return self.emotion_emotixsmall.predict(frame, 5, coords)
+    
+    def change_emotion_processor(self, processor_name):
+        self.current_processor = processor_name
+        return None
+    
+    def toggle_stress_consideration(self):
+        self.consider_stress = self.stress_button.isChecked()
+        if self.consider_stress:
+            self.stress_button.setText("Учитывать стресс в эмоциях - включено")
+        else:
+            self.stress_button.setText("Учитывать стресс в эмоциях - выключено")
+        return
+        
+    def select_model(self):
+        dialog = ModelSelectionDialog(self, self.current_processor)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            selected_model = dialog.get_selected_model()
+            self.change_emotion_processor(selected_model)
 
 
     def update_frame(self):
@@ -638,7 +640,7 @@ class FaceAnalysisApp(QMainWindow):
             self.stop_recording()
             return
         
-        # Skip frames based on frame_skip value
+        # Skip frames based on frame_skip value 
         if self.video_source[0] == "file":
             for _ in range(self.frame_skip - 1):
                 self.cap.read()
@@ -647,10 +649,11 @@ class FaceAnalysisApp(QMainWindow):
         if not ret:
             self.stop_recording()
         if ret:
+            processor_func = self.emotion_processors[self.current_processor]
             # Resize frame to 480x320
             frame = cv2.resize(frame, (480, 320))
             # Process the frame
-            face_landmarks, hands_landmarks = find_face_and_hands(frame, self.face_mesh, self.hands)
+            face_landmarks, hands_landmarks, coords = find_face_and_hands(frame, self.face_mesh, self.hands)
             
             if face_landmarks:
                 face = face_landmarks.landmark
@@ -658,20 +661,18 @@ class FaceAnalysisApp(QMainWindow):
 
                 # Get gaze direction
                 avg_gaze = get_avg_gaze(face)
-                self.avg_gaze = avg_gaze
+                self.gaze_values.append(avg_gaze)
+                if len(self.gaze_values) > 60:
+                    self.gaze_values = []
 
-                # Get heart rate data
-                cheekL = get_area(frame, False, topL=face[449], topR=face[350], bottomR=face[429], bottomL=face[280])
-                cheekR = get_area(frame, False, topL=face[121], topR=face[229], bottomR=face[50], bottomL=face[209])
-                bpm_display = get_bpm_tells(cheekL, cheekR, None)
+                bpm_display = self.pulse_predictor.predict(frame, coords)
 
                 # Update heart rate chart
-                try:
-                    bpm_value = float(bpm_display.split(':')[1].split()[0])
-                    self.bpm_values.append(bpm_value)
-                    self.chart.update_chart(current_time, bpm_value)
-                except (IndexError, ValueError):
-                    pass
+
+                bpm_value = float(bpm_display)
+                self.bpm_values.append(bpm_value)
+                self.current_pulse_value.setText(f"{bpm_value:.0f} уд/мин")
+                self.chart.update_chart(current_time, bpm_value)
 
                 # Update blinks and hand on face
                 is_blinking_now = is_blinking(face)
@@ -688,8 +689,15 @@ class FaceAnalysisApp(QMainWindow):
                 lip_ratio = get_lip_ratio(face)
                 self.lip_ratio_values.append(lip_ratio)
 
-                # Get emotion using the custom model
-                emotions = classify_image(frame)
+                emotions = processor_func(frame, coords)
+
+                # Use Stress for Emotion Detection
+                if self.consider_stress:
+                    current_stress = np.mean(self.stress_levels) if self.stress_levels else 0
+                    emotions = self.adjust_emotions_with_stress(emotions, current_stress)
+                self.emotions_chart.update_chart(current_time, emotions)
+
+                
                 if emotions:
                     emotion_translations = {
                         "sad": "грусть",
@@ -712,80 +720,90 @@ class FaceAnalysisApp(QMainWindow):
                 self.frame_count += 1
                 
                 # Detect stress and update stress chart
-                stress_level = self.detect_stress(frame, face)
+                stress_level = self.stress_detector.detect_stress(frame, face)
                 stress_level_rule = self.detect_stress_rule()
-                stress_level = stress_level * stress_level_rule
-                stress_level = stress_level if stress_level <= 1.0 else 1.0
+                stress_level = stress_level + stress_level_rule
+                stress_level = stress_level if stress_level <= 1.0 else 1.0 
                 self.stress_levels.append(stress_level)
-                self.stress_chart.update_chart(current_time, stress_level * 100)
+                if len(self.stress_levels) > 60:
+                    self.stress_levels = self.stress_levels[-60:]
+                #self.stress_chart.update_chart(current_time, stress_level * 100)
+                self.update_average_stress()
 
-            # Convert frame to QPixmap and display
-            rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_with_face = self.draw_face_frame(frame, coords)
+            rgb_image = cv2.cvtColor(frame_with_face, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb_image.shape
             bytes_per_line = ch * w
             q_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
             self.video_label.setPixmap(QPixmap.fromImage(q_image))
             
-
-
-    def detect_stress(self, image, face_landmarks):
-        # Convert to RGB
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        
-        # Get face bounding box
-        h, w, _ = image.shape
-        face_points = [(int(landmark.x * w), int(landmark.y * h)) for landmark in face_landmarks]
-        left = min(point[0] for point in face_points)
-        top = min(point[1] for point in face_points)
-        right = max(point[0] for point in face_points)
-        bottom = max(point[1] for point in face_points)
-        
-        # Extract the face
-        face_image = Image.fromarray(image[top:bottom, left:right])
-        
-        # Transform the image
-        input_tensor = stress_transform(face_image).unsqueeze(0)
-        
-        # Perform inference
-        with torch.no_grad():
-            outputs = stress_model(input_tensor)
-        
-        # Get prediction
-        probabilities = torch.nn.functional.softmax(outputs.logits, dim=-1)
-        confidence = probabilities[0][0].item()
-        
-        # Return result
-        return confidence
+    def draw_face_frame(self, frame, face_coords):
+        x, y, w, h = face_coords
+        if x is not None:
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 167, 0), 1)
+        return frame
 
     def detect_stress_rule(self):
-        # Calculate individual stress factors
+
+        frame_stress = 0
         bpm_stress = 0
+        lip_stress = 0
+        blink_stress = 0
+        hand_stress = 0
+        gaze_stress = 0
+
         if self.bpm_values:
-            avg_bpm = np.mean(self.bpm_values[-10:])
+            avg_bpm = np.mean(self.bpm_values[-5:])
             if avg_bpm > 100:
                 bpm_stress = 1.1
+                frame_stress += 0.25
 
         lip_stress = 0
         if self.lip_ratio_values:
             avg_lip_ratio = np.mean(self.lip_ratio_values[-10:])
             if avg_lip_ratio < 0.3:
                 lip_stress = 1.01
+                frame_stress += 0.25
 
-        blink_stress = 1.05 if self.blink_count > 8 else 0
-        hand_stress = 1.05 if self.hand_on_face_count > 2 else 0
+        if self.blink_count > 20:
+            blink_stress = 1.05
+            frame_stress += 0.20
 
         gaze_stress = 0
         if self.gaze_values:
-            gaze_change = detect_gaze_change(self.avg_gaze)
-            if gaze_change < 0.1:
-                gaze_stress = 1.05
+            gaze_change = calculate_gaze_score(self.gaze_values)
+            gaze_stress = gaze_change
+            frame_stress += gaze_change
 
-        # Calculate total stress for this frame
-        frame_stress = bpm_stress + lip_stress + blink_stress + hand_stress + gaze_stress
-
-
+        
+        #frame_stress = bpm_stress + lip_stress + blink_stress + hand_stress + gaze_stress
+        """
+        print("-"*30)
+        print(f"Уровень стресса по сердечному ритму (BPM): {bpm_stress}")
+        print(f"Уровень стресса по губам: {lip_stress}")
+        print(f"Уровень стресса по морганию: {blink_stress}")
+        print(f"Уровень стресса по движениям руки: {hand_stress}")
+        print(f"Уровень стресса по взгляду: {gaze_stress}")
+        print(f"Общий уровень стресса на кадр: {frame_stress}")
+        """
+        
         return frame_stress
-    
+    def adjust_emotions_with_stress(self, emotions, stress_level):
+        stress_factor = stress_level 
+
+        adjusted_emotions = emotions.copy()
+        
+        for emotion in ['angry', 'fear', 'sad', 'disgust', 'happy', 'surprise']:
+            if emotion in adjusted_emotions:
+                adjusted_emotions[emotion] *= (1 + stress_factor * 0.1)
+        
+        if 'neutral' in adjusted_emotions:
+            adjusted_emotions['neutral'] *= (1 - stress_factor * 0.05)
+        
+        total = sum(adjusted_emotions.values())
+        adjusted_emotions = {k: v / total for k, v in adjusted_emotions.items()}
+        
+        return adjusted_emotions
 
     def update_average_stress(self):
         if self.stress_levels:
